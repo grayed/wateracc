@@ -1,0 +1,635 @@
+#define DEBUG
+
+#include <avr/eeprom.h>
+#include <limits.h>
+#include <TinyWireM.h>
+#include <LiquidCrystal_I2C.h>
+#include <PinChangeInterrupt.h>
+
+#include "symbols.inc"
+
+#ifndef countof
+#define countof(x)	(sizeof(x) / sizeof(x[0]))
+#endif
+
+#define FLOWSENSOR	PIN_PB1		// contains LED by intention
+#define BUTTON		PIN_PB4
+
+#define LCD_ADDR	0x27
+#define LCD_COLS	16
+#define LCD_ROWS	2
+LiquidCrystal_I2C main_lcd(LCD_ADDR, LCD_COLS, LCD_ROWS);
+
+#ifdef DEBUG
+# define DEBUG_LCD_ADDR	0x26
+# define DEBUG_LCD_COLS	8
+# define DEBUG_LCD_ROWS	2
+LiquidCrystal_I2C debug_lcd(DEBUG_LCD_ADDR, DEBUG_LCD_COLS, DEBUG_LCD_ROWS);
+
+bool fake_mode;
+#endif
+
+#ifdef DEBUG
+uint32_t log_num;
+void dlog(const char *line1, const char *line2 = nullptr) {
+	debug_lcd.clear();
+	if (line1)
+		debug_lcd.print(line1);
+	debug_lcd.setCursor(0, 1);
+	debug_lcd.print(++log_num);
+	if (line2) {
+		debug_lcd.print(' ');
+		debug_lcd.print(line2);
+	}
+	delay(500);
+}
+#else
+#define dlog(x)		do { } while(0)
+#endif
+
+
+//------//
+// Data //
+//------//
+
+#define FILTERS_CNT	2
+
+// in milliliters
+uint32_t counters[1 + FILTERS_CNT + 1 /* CRC */];
+uint32_t filters_limit[FILTERS_CNT] = {
+	120000000,	// mechanical
+	 50000000	// ferrum
+};
+bool counters_dirty;
+
+uint32_t flow_rate;		// milliliters per minute
+
+// When there are no impulses for FLOW_RECALC_PERIOD or more,
+// treat first one we see as occured FLOW_START_PERIOD earlier.
+// Otherwise, we'll be wrong about, e.g., a single impulse
+// happening in a long time.
+#define FLOW_START_PERIOD        1000	// microseconds
+#define FLOW_RECALC_PERIOD     100000	// microseconds
+
+// period: microseconds
+// count: number of impulses during period
+// Returns milliliters per minute.
+uint32_t flow_rate_from_period(uint32_t period, uint16_t count) {
+/*
+	freq = count / period			// раз в микросекунду
+	freq = count * 60 * 1000_000 / period	// раз в минуту
+
+	m_count = time * freq			// кол-во за 1 мин.
+	m_count = 1    * count * 60 * 1000_000 / period =
+	        = count * 60_000_000 / period =
+	        = 60_000_000 / period * count =
+
+	rate =  m_count / 6 +  8			// л/мин
+	rate = (m_count / 3 + 16) * 500			// мл/мин
+
+	rate = (   60_000_000 / period * count / 3 +   16) * 500 =
+	     = (   20_000_000 / period * count     +   16) * 500 =
+	     = (2_000_000_000 / period * count     + 1600) *   5
+
+	Поэтому если period/count меньше 3, результат необходимо искажать,
+	иначе мы выйдем за пределы вместимости uint32_t.
+*/
+	if (period / count < 3)
+		period = 3 * count;
+	return (2000000000UL / period * count + 1600) * 5;
+}
+
+#define EEPROM_SIZE	0x0200
+
+/* EEPROM layout
+ *
+ * 0x0000..0x00FF	unused by us, contains custom symbols
+ * 0x0100..0x01FC	counters, spread for wear leveling
+ * 0x01FD..0x01FF	unused by us
+ */
+
+// EEPROM address and size of `total` storage, taking care of wear leveling
+// We use all the second half of EEPROM to save counters
+#define FLOW_DATA		(uint32_t*)(EEPROM_SIZE / 2)	// initial offset
+#define FLOW_DATA_CELLS		(EEPROM_SIZE / 2 / sizeof(counters))
+#define FLOW_DATA_LAST		(FLOW_DATA + FLOW_DATA_CELLS - 1)
+
+// last used EEPROM address for saved version of `total'
+uint32_t* counters_ee = (uint32_t*)FLOW_DATA;
+
+// CRC32 without a table
+inline uint32_t calculate_checksum(const uint32_t *v) {
+#ifdef DEBUG
+	return 0;
+#else
+	uint32_t crc;
+	uint8_t tval, i;
+	size_t len = sizeof(counters) - sizeof(counters[0]);;
+	const char *buf = (const char *)v;
+
+	crc = 0xFFFFFFFFUL;
+	while (len--) {
+		tval = (crc ^ *buf++) & 0xFF;
+		for (i = 0; i < 8; i++)
+			tval = tval & 1 ? (tval >> 1) ^ 0xEDB88320UL : tval >> 1;
+		crc = tval ^ (crc >> 8);
+	}
+	return crc ^ 0xFFFFFFFFUL;
+#endif
+}
+
+bool is_checksum_valid(uint32_t *ee) {
+	uint32_t v[countof(counters)];
+	eeprom_read_block(v, ee, sizeof(v));
+	return calculate_checksum(v) == v[countof(v)-1];
+}
+
+void initialize_storage() {
+	uint32_t v[countof(counters)];
+	v[2] = v[1] = v[0] = 0;
+	v[3] = calculate_checksum(v);
+	eeprom_write_block(v, FLOW_DATA, sizeof(v));
+}
+
+uint32_t* find_largest_total() {
+	uint32_t *a, *aleft, *aright;
+	uint32_t  v,  vleft,  vright;
+
+	aleft  = FLOW_DATA;
+	aright = FLOW_DATA_LAST;
+	vleft  = eeprom_read_dword(aleft);
+	vright = eeprom_read_dword(aright);
+	// maximum value hides in the middle, let's bisect it
+	while (vleft > vright) {
+		a = aleft + ((aright - aleft) / 2);
+		a = (uint32_t*)((uint32_t)a / sizeof(counters) * sizeof(counters)); // align
+		v = eeprom_read_dword(a);
+		if (v <= vleft) {
+			vright = v;
+			aright = a;
+		} else {
+			vleft = v;
+			aleft = a;
+		}
+	}
+	a = aright;
+
+	while (!is_checksum_valid(a) && a > FLOW_DATA)
+		a -= countof(counters);
+	if (!is_checksum_valid(a)) {
+		a = FLOW_DATA_LAST;
+		while (!is_checksum_valid(a) && a > aright)
+			a -= countof(counters);
+		if (!is_checksum_valid(a)) {
+			// no valid records found
+			initialize_storage();
+			a = FLOW_DATA;
+		}
+	}
+
+	return a;
+}
+
+void load_stats() {
+	counters_ee = find_largest_total();
+	eeprom_read_block(counters, counters_ee, sizeof(counters));
+	counters_dirty = false;
+	dlog("Загружен");
+}
+
+void save_stats() {
+	if (!fake_mode) {
+		if (++counters_ee > FLOW_DATA_LAST)
+			counters_ee = FLOW_DATA;
+		eeprom_update_block(counters, counters_ee, sizeof(counters));
+	}
+	counters_dirty = false;
+	dlog("Выгружен");
+}
+
+void reset_total_counter() {
+	counters[0] = 0;
+
+	if (!fake_mode) {
+		// First, reset smallest values we had, keeping current address
+		// for the last; this will save us in case of (power) failure.
+		for (auto a = counters_ee + countof(counters);
+		     a <= FLOW_DATA_LAST;
+		     a += countof(counters))
+			eeprom_update_dword(a, 0);
+		for (auto a = FLOW_DATA; a <= counters_ee; a += countof(counters))
+			eeprom_update_dword(a, 0);
+	}
+	counters_dirty = false;
+	dlog("Сброшен", "общий");
+}
+
+
+//----------------//
+// User interface //
+//----------------//
+
+#define LONG_PRESS	 4000	// duration of `long' button press, millisec
+#define UI_TIMEOUT	30000	// timeout after last button press, millisec
+#define UI_MIN_DISPLAY    500   // minimum between screen updates, millisec
+#define ROTATE_TIMEOUT	10000	// switching screens automatically, millisec
+#define BLINK_INTERVAL	 1000	// millisec
+#define SAVE_INTERVAL	10000	// how often to call save_stats(), millisec
+
+#define MIN_UI_COUNTER_SCALE	1000	// some details are not visible to user
+
+#define SCREEN_TOTAL	0
+#define SCREEN_FILTER	1
+int cur_screen;
+bool ui_dirty;		// if true, we should update displayed text
+
+void next_screen() {
+	++cur_screen %= (FILTERS_CNT + 1);
+	ui_dirty = true;
+}
+
+size_t number_width(uint32_t n) {
+	size_t numw = 0;
+	for (uint32_t t = n; t > 0; t /= 10)
+		numw++;
+	if (numw == 0)
+		numw = 1;
+	return numw;
+}
+
+void print_num(LiquidCrystal_I2C &lcd, uint32_t n, uint8_t width) {
+	size_t numw = number_width(n);
+	while (width-- > numw)
+		lcd.print(' ');
+	lcd.print(n);
+}
+
+#ifdef DEBUG
+void print_fake_mode(LiquidCrystal_I2C &lcd) {
+	lcd.setCursor(0, 1);
+	lcd.print("Fake mode is ");
+	lcd.print(fake_mode ? "ON" : "OFF");
+}
+#endif
+
+#define SYM_F   char(0)
+#define SYM_i   char(1)
+#define SYM_l   char(2)
+#define SYM_soft_sign   char(3)
+#define SYM_t   char(4)
+#define SYM_g	char(5)
+#define SYM_m	char(6)
+#define SYM_3up	char(7)
+#define SYM_rarrow char(126)		// on main screen only
+
+const uint8_t filter_str[] = {
+	SYM_F, SYM_i, SYM_l, SYM_soft_sign, SYM_t, 'p'
+};
+const uint8_t left_str[] = {
+	'O', 'c', SYM_t, 'a', SYM_l, 'o', 'c', SYM_soft_sign
+};
+
+void load_custom_symbol(LiquidCrystal_I2C &lcd, char sym, const uint8_t lines[]) {
+//	uint8_t tmp[8];
+//	eeprom_read_block(tmp, lines, sizeof(tmp));
+//	lcd.createChar(sym, tmp);
+
+	uint8_t tmp[8];
+	for (size_t i = 0; i < 8; i++)
+		tmp[i] = pgm_read_byte(lines + i);
+	lcd.createChar(sym, tmp);
+
+//	lcd.createChar(sym, lines);
+}
+
+bool needs_attention() {
+	if (cur_screen == SCREEN_TOTAL)
+		return false;
+	return counters[cur_screen] >= filters_limit[cur_screen - SCREEN_FILTER];
+}
+
+void print_cur_flow_speed(LiquidCrystal_I2C &lcd) {
+	lcd.setCursor(0, 1);
+
+	size_t nw = number_width(flow_rate);
+	if (flow_rate > 0) {
+		for (size_t i = 0; i < nw - 1; i++)
+			lcd.print('-');
+		lcd.print(SYM_rarrow);
+	}
+
+	print_num(lcd, flow_rate / 1000, lcd.cols() - nw - 5);
+	lcd.print('.');
+	lcd.print(flow_rate % 1000 / 100);
+	lcd.print(SYM_l);
+	lcd.print("/m");
+}
+
+void print_counter(LiquidCrystal_I2C &lcd, uint32_t value, size_t display_size) {
+	if (value < 6000000) {
+		print_num(lcd, value / 1000, display_size - 1);
+		lcd.print(SYM_l);
+	} else {
+		print_num(lcd, value / 1000000, display_size - 2);
+		lcd.print(SYM_m);
+		lcd.print(SYM_3up);
+	}
+}
+
+void print_total(LiquidCrystal_I2C &lcd) {
+	lcd.clear();
+	lcd.print("Bce");
+	lcd.print(SYM_g);
+	lcd.print("o ");
+	// 6 columns eaten so far
+	print_counter(lcd, counters[0], lcd.cols() - 6);
+
+#ifdef DEBUG
+	if (fake_mode)
+		print_fake_mode(lcd);
+	else
+#endif
+		print_cur_flow_speed(lcd);
+}
+
+// num is 1-based
+void print_filter(LiquidCrystal_I2C &lcd, int num) {
+	uint32_t pct = counters[num] / (filters_limit[num-1] / 1000);
+	pct = (pct > 100) ? 0 : 100 - pct;
+
+	lcd.clear();
+	lcd.write(filter_str, sizeof(filter_str));
+	lcd.print(' ');
+	print_num(lcd, num, 1);
+	// 8 columns eaten so far
+	print_counter(lcd, counters[num], lcd.cols() - 8);
+
+	lcd.setCursor(0, 1);
+	lcd.write(left_str, sizeof(left_str));
+	lcd.print(' ');
+	lcd.print(pct);
+	lcd.print('%');
+	if (needs_attention())
+		lcd.print("!");
+}
+
+
+//-----------//
+// Main code //
+//-----------//
+
+volatile uint16_t flow_impulse_cnt;	// is grown by interrupt handler
+uint32_t prev_flow_impulse_mcs;		// timestamp of previous measurement
+
+// interrupt handler
+void handle_flow_sensor() {
+	flow_impulse_cnt++;
+}
+
+void advance_counters(uint32_t n) {
+	uint32_t old_ui_counters[1 + FILTERS_CNT];
+
+	for (size_t i = 0; i < countof(old_ui_counters); i++)
+		old_ui_counters[i] = counters[i] / MIN_UI_COUNTER_SCALE;
+
+	counters[0] += n;
+	counters[1] += n;
+	counters[2] += n;
+
+	counters_dirty = true;
+	for (size_t i = 0; !ui_dirty && i < countof(old_ui_counters); i++)
+		if (counters[i] / MIN_UI_COUNTER_SCALE != old_ui_counters[i])
+			ui_dirty = true;
+}
+
+// normal mode operation
+void proceed_flow() {
+	static uint16_t prev_flow_impulse_cnt;		// carefully handle multiple impluses
+
+	// advance counters; we should access flow_impulse_cnt only once
+	uint32_t impulse_delta = flow_impulse_cnt - prev_flow_impulse_cnt;
+
+#if 0
+	static uint32_t moo;
+	static uint32_t boo, mmm;
+	mmm = now_mcs / 1000000;
+	moo += impulse_delta;
+	if (mmm != boo) {
+		boo = mmm;
+		debug_lcd.clear();
+		debug_lcd.print(digitalRead(FLOWSENSOR));
+		debug_lcd.print(' ');
+		print_num(debug_lcd, moo, 6);
+		debug_lcd.setCursor(0, 1);
+		debug_lcd.print(flow_impulse_cnt);
+		moo = 0;
+	}
+#endif
+
+	uint32_t now_mcs = micros();
+	uint32_t period = now_mcs - prev_flow_impulse_mcs;
+#ifdef DEBUG
+	if (fake_mode) {
+		advance_counters(rand());
+	} else
+#endif
+	if (impulse_delta) {
+		if (period >= FLOW_RECALC_PERIOD) {
+			flow_rate = flow_rate_from_period(period, impulse_delta);
+			advance_counters(flow_rate * period);
+			prev_flow_impulse_cnt += impulse_delta;
+			prev_flow_impulse_mcs = now_mcs;
+		}
+	} else {
+		if (period >= FLOW_RECALC_PERIOD) {
+			if (flow_rate != 0) {
+				flow_rate = 0;
+				ui_dirty = true;
+			}
+			prev_flow_impulse_mcs = now_mcs - FLOW_START_PERIOD;
+		}
+	}
+}
+
+void proceed_button() {
+	static uint32_t pressed_ts;		// ms timestamp of last button press
+	static uint32_t released_ts;		// ms timestamp of last button release
+	static uint32_t last_blink_ts;		// ms timestamp of last backlight switch
+	static uint32_t last_rotation_ts;	// ms timestamp of last auto screen display
+	static bool was_pressed;		// previous button state
+	static bool reset_done;			// did we already reset counters during current button press?
+	static bool first_press = true;		// first press should just enable backlight
+
+	bool is_pressed = (digitalRead(BUTTON) == HIGH);
+	if (is_pressed != was_pressed) {
+		// debounce
+		delay(10);
+		is_pressed = (digitalRead(BUTTON) == HIGH);
+	}
+
+	uint32_t now = millis();
+	if (now == 0)
+		now = 1;	// 0 is special
+
+	// handle button pressings
+	if (is_pressed != was_pressed) {
+		if (is_pressed) {
+			pressed_ts = now;
+			main_lcd.backlight();
+		} else {
+			if (!reset_done && !first_press)
+				next_screen();
+			reset_done = false;
+			first_press = false;
+			released_ts = now;
+		}
+	} else if (is_pressed) {
+		if (now - pressed_ts >= LONG_PRESS && !reset_done) {
+			reset_done = true;
+			if (cur_screen == SCREEN_TOTAL) {
+#ifdef DEBUG
+				if (fake_mode) {
+					main_lcd.backlight();
+					fake_mode = false;
+					print_fake_mode(main_lcd);
+					delay(3000);
+					load_stats();
+				} else
+#endif
+					reset_total_counter();
+			} else {
+				counters[cur_screen] = 0;
+				dlog("Сброшен", cur_screen == 1 ? "ф1" : "ф2");
+				save_stats();
+			}
+			ui_dirty = true;
+
+			// avoid repeating
+			is_pressed = false;
+		}
+	} else if (released_ts) {
+		// the button hase been released, continue displaying current screen until UI_TIMEOUT
+		if (now - released_ts >= UI_TIMEOUT) {
+			// back to standby mode
+			main_lcd.noBacklight();
+			released_ts = 0;
+			last_rotation_ts = now - ROTATE_TIMEOUT;
+		}
+	} else {
+		// the button was released some time ago
+		if (now - last_rotation_ts >= ROTATE_TIMEOUT) {
+			last_rotation_ts = now;
+			next_screen();
+		}
+
+		if (needs_attention()) {
+			if (now - last_blink_ts >= BLINK_INTERVAL / 2) {
+				last_blink_ts = now;
+				main_lcd.setBacklight(!main_lcd.isBacklightOn());
+			}
+		} else {
+			main_lcd.noBacklight();
+			first_press = true;
+		}
+	}
+	was_pressed = is_pressed;
+}
+
+void setup()
+{
+	OSCCAL = 85;
+
+	TinyWireM.begin();
+
+#ifdef DEBUG
+	debug_lcd.begin(true);
+	debug_lcd.backlight();
+	debug_lcd.clear();
+#endif
+
+	main_lcd.begin();
+	main_lcd.clear();
+	main_lcd.backlight();
+
+	dlog("Загрузка", "символ");
+	main_lcd.print(".");
+	load_custom_symbol(main_lcd, SYM_F, symbol_rus_F);
+	load_custom_symbol(main_lcd, SYM_i, symbol_rus_i);
+	load_custom_symbol(main_lcd, SYM_l, symbol_rus_l);
+	load_custom_symbol(main_lcd, SYM_soft_sign, symbol_rus_soft_sign);
+	load_custom_symbol(main_lcd, SYM_t, symbol_rus_t);
+	load_custom_symbol(main_lcd, SYM_g, symbol_rus_g);
+	load_custom_symbol(main_lcd, SYM_m, symbol_rus_m);
+	load_custom_symbol(main_lcd, SYM_3up, symbol_3up);
+	main_lcd.clear();	// this or setCursor() required after loading load_custom symbols
+
+	dlog("Настройк", "входов");
+	main_lcd.print("..");
+	pinMode(BUTTON, INPUT);
+	pinMode(FLOWSENSOR, INPUT);
+	attachPCINT(digitalPinToPCINT(FLOWSENSOR), handle_flow_sensor, RISING);
+
+#ifdef DEBUG
+	if (digitalRead(BUTTON) == HIGH) {
+		srand(12345);
+		fake_mode = true;
+		print_fake_mode(main_lcd);
+		delay(3000);
+	} else
+#endif
+	{
+		load_stats();
+	}
+
+	main_lcd.print('.');
+	dlog("Работа");
+	ui_dirty = true;
+
+	// This initialization should happen as late as possible,
+	// to make first flow rate calculation correct.
+	prev_flow_impulse_mcs = micros();
+}
+
+void loop() {
+	static uint32_t last_save_ts;		// ms timestamp of last save_stats() call
+	static uint32_t last_ui_update_ts;	// ms timestamp of last ui_dirty reset
+
+#ifdef DEBUG
+	// try to make fake data look like a bit more random()
+	if (fake_mode)
+		rand();
+#endif
+
+	proceed_button();
+	proceed_flow();
+
+	uint32_t now = millis();
+	if (counters_dirty) {
+		if (now - last_save_ts >= SAVE_INTERVAL
+#ifdef DEBUG
+		    && !fake_mode
+#endif
+		    ) {
+			last_save_ts = now;
+			save_stats();
+		}
+	} else
+		last_save_ts = now;	// avoid immediate save
+
+	auto period = now - last_ui_update_ts;
+	if (ui_dirty) {
+		if (period >= UI_MIN_DISPLAY) {
+			if (cur_screen == SCREEN_TOTAL)
+				print_total(main_lcd);
+			else
+				print_filter(main_lcd, cur_screen);
+			ui_dirty = false;
+			last_ui_update_ts = now;
+		}
+	} else {
+		if (period > UI_MIN_DISPLAY)
+			last_ui_update_ts = now - UI_MIN_DISPLAY;
+		else
+			last_ui_update_ts = now;
+	}
+}
